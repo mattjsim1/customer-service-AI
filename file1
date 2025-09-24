@@ -1,0 +1,305 @@
+# Improved Solar Savings Agent with LangGraph and AWS Bedrock
+# Security: AWS credentials removed - use IAM roles or AWS CLI configuration
+
+import os
+import uuid
+import boto3
+from typing import Annotated, List
+from typing_extensions import TypedDict
+
+from langchain_core.tools import tool
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable, RunnableLambda
+from langchain_aws import ChatBedrock
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, BaseMessage
+from langgraph.graph.message import AnyMessage, add_messages
+from langgraph.prebuilt import ToolNode
+from langgraph.prebuilt import tools_condition
+from langgraph.graph import START, StateGraph
+
+# Import MessagesPlaceholder with fallback
+try:
+    from langchain_core.prompts import MessagesPlaceholder
+    HAS_MESSAGES_PLACEHOLDER = True
+except ImportError:
+    MessagesPlaceholder = None
+    HAS_MESSAGES_PLACEHOLDER = False
+
+
+# Solar savings calculation tool
+@tool
+def compute_savings(monthly_cost: float) -> dict:
+    """
+    Tool to compute the potential savings when switching to solar energy 
+    based on the user's monthly electricity cost.
+    
+    Args:
+        monthly_cost: Monthly electricity cost in dollars
+        
+    Returns:
+        dict: Contains number_of_panels, installation_cost, net_savings_10_years
+    """
+    def calculate_solar_savings(monthly_cost):
+        # Solar calculation parameters
+        cost_per_kWh = 0.28
+        cost_per_watt = 1.50
+        sunlight_hours_per_day = 3.5
+        panel_wattage = 350
+        system_lifetime_years = 10
+
+        # Calculate system requirements
+        monthly_consumption_kWh = monthly_cost / cost_per_kWh
+        daily_energy_production = monthly_consumption_kWh / 30
+        system_size_kW = daily_energy_production / sunlight_hours_per_day
+
+        # Calculate panels and costs
+        number_of_panels = system_size_kW * 1000 / panel_wattage
+        installation_cost = system_size_kW * 1000 * cost_per_watt
+
+        # Calculate savings
+        annual_savings = monthly_cost * 12
+        total_savings_10_years = annual_savings * system_lifetime_years
+        net_savings = total_savings_10_years - installation_cost
+
+        return {
+            "number_of_panels": round(number_of_panels),
+            "installation_cost": round(installation_cost, 2),
+            "net_savings_10_years": round(net_savings, 2),
+            "monthly_cost": monthly_cost,
+            "annual_savings": round(annual_savings, 2)
+        }
+
+    return calculate_solar_savings(monthly_cost)
+
+
+# State definition
+class State(TypedDict):
+    messages: Annotated[List[AnyMessage], add_messages]
+
+
+# Error handling for tools
+def handle_tool_error(state) -> dict:
+    error = state.get("error")
+    tool_calls = state["messages"][-1].tool_calls
+    return {
+        "messages": [
+            ToolMessage(
+                content=f"Error: {repr(error)}\nPlease fix your mistakes.",
+                tool_call_id=tc["id"],
+            )
+            for tc in tool_calls
+        ]
+    }
+
+
+def create_tool_node_with_fallback(tools: list) -> ToolNode:
+    return ToolNode(tools).with_fallbacks(
+        [RunnableLambda(handle_tool_error)],
+        exception_key="error"
+    )
+
+
+# Assistant class
+class Assistant:
+    def __init__(self, runnable: Runnable):
+        self.runnable = runnable
+
+    def __call__(self, state: State):
+        while True:
+            result = self.runnable.invoke(state)
+            # Check if we got a valid response
+            if not getattr(result, "tool_calls", None) and (
+                not getattr(result, "content", None) or
+                (isinstance(result.content, list) and 
+                 not result.content[0].get("text", "").strip())
+            ):
+                # Re-prompt for a real output
+                messages = state["messages"] + [
+                    HumanMessage(content="Please respond with a real output.")
+                ]
+                state = {**state, "messages": messages}
+            else:
+                break
+        return {"messages": result}
+
+
+# AWS Bedrock setup - TEST CREDENTIALS (DO NOT USE IN PRODUCTION)
+os.environ["AWS_ACCESS_KEY_ID"] = "AKIAYB7IDXHHIYQ434FV"
+os.environ["AWS_SECRET_ACCESS_KEY"] = "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"
+
+def get_bedrock_client(region: str = "us-east-2"):
+    """Create Bedrock client using test credentials"""
+    return boto3.client("bedrock-runtime", region_name=region)
+
+
+def create_bedrock_llm(client, model_id: str):
+    """Create ChatBedrock instance"""
+    return ChatBedrock(
+        model_id=model_id,
+        provider="anthropic",
+        client=client,
+        model_kwargs={'temperature': 0},
+        region_name=client.meta.region_name
+    )
+
+
+# Create the solar assistant
+def create_solar_assistant(model_id: str = None):
+    """
+    Create a solar savings assistant agent
+    
+    Args:
+        model_id: Bedrock model ID or inference profile ARN
+    """
+    # Use your inference profile ARN
+    if model_id is None:
+        model_id = "arn:aws:bedrock:us-east-2:554000693710:inference-profile/global.anthropic.claude-sonnet-4-20250514-v1:0"
+    
+    # Create LLM
+    bedrock_client = get_bedrock_client()
+    llm = create_bedrock_llm(bedrock_client, model_id)
+    
+    # System prompt
+    system_text = """You are a helpful customer support assistant for Solar Panels Belgium.
+
+Your task is to help customers calculate their potential solar energy savings.
+
+You need to gather the following information:
+- Monthly electricity cost (in dollars)
+
+Important guidelines:
+- If you cannot determine the monthly electricity cost, ask the customer to clarify
+- Do not guess or assume values
+- Once you have the monthly cost, use the compute_savings tool to calculate savings
+- Present the results in a friendly, informative way
+- Explain what the numbers mean in practical terms
+
+After calculating, explain:
+- How many solar panels they would need
+- The installation cost
+- Their net savings over 10 years
+- How this translates to annual savings
+"""
+
+    # Create prompt template
+    if HAS_MESSAGES_PLACEHOLDER:
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_text),
+            MessagesPlaceholder(variable_name="messages"),
+        ])
+    else:
+        # Fallback for older versions
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_text),
+            ("human", "{messages}"),
+        ])
+
+    # Tools
+    tools = [compute_savings]
+    
+    # Create runnable with tool binding
+    assistant_runnable = prompt | llm.bind_tools(tools)
+    
+    # Build state graph
+    builder = StateGraph(State)
+    builder.add_node("assistant", Assistant(assistant_runnable))
+    builder.add_node("tools", create_tool_node_with_fallback(tools))
+    
+    builder.add_edge(START, "assistant")
+    builder.add_conditional_edges("assistant", tools_condition)
+    builder.add_edge("tools", "assistant")
+    
+    # Compile graph
+    graph = builder.compile()
+    
+    return graph
+
+
+# Example usage
+def run_example():
+    """Run example conversation"""
+    
+    # Create the assistant
+    graph = create_solar_assistant()
+    
+    # Create conversation thread
+    thread_id = str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+    
+    # Example questions
+    questions = [
+        "Hi there!",
+        "I want to know about solar savings",
+        "My monthly electricity bill is $120"
+    ]
+    
+    print("=== Solar Savings Assistant Demo ===\n")
+    
+    # Process each question
+    for i, question in enumerate(questions, 1):
+        print(f"User ({i}): {question}")
+        
+        # Stream the response
+        events = graph.stream(
+            {"messages": [HumanMessage(content=question)]}, 
+            config, 
+            stream_mode="values"
+        )
+        
+        for event in events:
+            if "messages" in event:
+                last_message = event["messages"][-1]
+                if hasattr(last_message, 'content') and last_message.content:
+                    if isinstance(last_message, AIMessage):
+                        print(f"Assistant: {last_message.content}")
+                    elif isinstance(last_message, ToolMessage):
+                        print(f"Tool Result: {last_message.content}")
+        
+        print("-" * 50)
+
+
+# Utility function to create a simple chat interface
+def create_chat_interface():
+    """Create an interactive chat interface"""
+    graph = create_solar_assistant()
+    thread_id = str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+    
+    print("=== Solar Savings Calculator ===")
+    print("Type 'quit' to exit\n")
+    
+    while True:
+        user_input = input("You: ").strip()
+        
+        if user_input.lower() in ['quit', 'exit', 'bye']:
+            print("Goodbye!")
+            break
+            
+        if not user_input:
+            continue
+        
+        try:
+            # Process the message
+            events = graph.stream(
+                {"messages": [HumanMessage(content=user_input)]}, 
+                config, 
+                stream_mode="values"
+            )
+            
+            for event in events:
+                if "messages" in event:
+                    last_message = event["messages"][-1]
+                    if hasattr(last_message, 'content') and last_message.content:
+                        if isinstance(last_message, AIMessage):
+                            print(f"Assistant: {last_message.content}\n")
+                            
+        except Exception as e:
+            print(f"Error: {e}\n")
+
+
+if __name__ == "__main__":
+    # Run example
+    run_example()
+    
+    # Uncomment to start interactive chat
+    # create_chat_interface()
