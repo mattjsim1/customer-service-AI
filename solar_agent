@@ -4,6 +4,8 @@
 import os
 import uuid
 import boto3
+import time
+import random
 from typing import Annotated, List
 from typing_extensions import TypedDict
 
@@ -123,34 +125,160 @@ class Assistant:
         return {"messages": result}
 
 
-# AWS Bedrock setup - TEST CREDENTIALS (DO NOT USE IN PRODUCTION)
-os.environ["AWS_ACCESS_KEY_ID"] = "AKIAYB7IDXHHIYQ434FV"
-os.environ["AWS_SECRET_ACCESS_KEY"] = "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"
+# AWS Bedrock setup with secure credential handling
+def setup_credentials_from_file(credentials_file: str = "aws_credentials.txt"):
+    """
+    Load credentials from a local file (for development only).
+    File format should be:
+    AWS_ACCESS_KEY_ID=your_access_key_here
+    AWS_SECRET_ACCESS_KEY=your_secret_key_here
+    """
+    print(f"Looking for credentials file: {credentials_file}")
+    print(f"Current working directory: {os.getcwd()}")
+    
+    if os.path.exists(credentials_file):
+        print(f"✅ Found credentials file: {credentials_file}")
+        with open(credentials_file, 'r') as f:
+            lines = f.readlines()
+            print(f"File has {len(lines)} lines")
+            
+            for line_num, line in enumerate(lines, 1):
+                line = line.strip()
+                print(f"Line {line_num}: '{line}'")
+                
+                if line and not line.startswith('#'):
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip()
+                        os.environ[key] = value
+                        print(f"✅ Set {key} = {value[:10]}...")  # Only show first 10 chars for security
+        
+        # Verify credentials were set
+        access_key = os.environ.get('AWS_ACCESS_KEY_ID')
+        secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY')
+        
+        if access_key and secret_key:
+            print(f"Credentials loaded successfully!")
+            print(f"Access Key: {access_key[:10]}...")
+            print(f"Secret Key: {secret_key[:10]}...")
+            return True
+        else:
+            print("Credentials not found in environment after loading file")
+            return False
+
+
+def exponential_backoff_retry(func, max_retries=5, base_delay=1, max_delay=60):
+    """
+    Execute a function with exponential backoff retry logic.
+    
+    Args:
+        func: Function to execute
+        max_retries: Maximum number of retry attempts
+        base_delay: Initial delay in seconds
+        max_delay: Maximum delay between retries
+    
+    Returns:
+        Function result or raises the last exception
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return func()
+        except Exception as e:
+            if attempt == max_retries:
+                raise e
+            
+            # Check if it's a rate limiting error
+            if any(error_type in str(e) for error_type in [
+                "ThrottlingException", 
+                "Too many requests", 
+                "RateLimitError",
+                "rate limit"
+            ]):
+                # Calculate delay with exponential backoff and jitter
+                delay = min(base_delay * (2 ** attempt), max_delay)
+                jitter = random.uniform(0.1, 0.3) * delay  # Add 10-30% jitter
+                total_delay = delay + jitter
+                
+                print(f"Rate limit hit (attempt {attempt + 1}/{max_retries + 1}). "
+                      f"Waiting {total_delay:.1f} seconds before retry...")
+                time.sleep(total_delay)
+            else:
+                # For non-rate-limiting errors, re-raise immediately
+                raise e
+
+
+def safe_stream_with_backoff(graph, input_data, config, max_retries=3):
+    """
+    Stream graph events with exponential backoff for rate limiting.
+    """
+    def stream_function():
+        return list(graph.stream(input_data, config, stream_mode="values"))
+    
+    return exponential_backoff_retry(
+        stream_function, 
+        max_retries=max_retries, 
+        base_delay=5,  # Start with 5 seconds
+        max_delay=120  # Max 2 minutes between retries
+    )
+
 
 def get_bedrock_client(region: str = "us-east-2"):
-    """Create Bedrock client using test credentials"""
-    return boto3.client("bedrock-runtime", region_name=region)
+    """
+    Create Bedrock client using secure credential methods.
+    
+    Priority order:
+    1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+    2. AWS credentials file (~/.aws/credentials)
+    3. IAM roles (for EC2/Lambda/ECS)
+    4. AWS CLI configuration
+    """
+    try:
+        # Check if credentials are available in environment
+        if os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY"):
+            print("Using AWS credentials from environment variables")
+        else:
+            print("Using AWS default credential chain (CLI/IAM roles/credentials file)")
+        
+        return boto3.client("bedrock-runtime", region_name=region)
+    
+    except Exception as e:
+        print(f"Error creating Bedrock client: {e}")
+        print("\nCredential setup options:")
+        print("1. Set environment variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY")
+        print("2. Run 'aws configure' to setup AWS CLI credentials")
+        print("3. Use IAM roles if running on AWS infrastructure")
+        print("4. Create ~/.aws/credentials file manually")
+        raise
 
 
 def create_bedrock_llm(client, model_id: str):
-    """Create ChatBedrock instance"""
+    """Create ChatBedrock instance with retry configuration"""
     return ChatBedrock(
         model_id=model_id,
         provider="anthropic",
         client=client,
-        model_kwargs={'temperature': 0},
+        model_kwargs={
+            'temperature': 0,
+            'max_tokens': 5000
+        },
         region_name=client.meta.region_name
     )
 
 
 # Create the solar assistant
-def create_solar_assistant(model_id: str = None):
+def create_solar_assistant(model_id: str = None, credentials_file: str = None):
     """
     Create a solar savings assistant agent
     
     Args:
         model_id: Bedrock model ID or inference profile ARN
+        credentials_file: Optional path to credentials file for development
     """
+    # Setup credentials if file is provided
+    if credentials_file:
+        setup_credentials_from_file(credentials_file)
+    
     # Use your inference profile ARN
     if model_id is None:
         model_id = "arn:aws:bedrock:us-east-2:554000693710:inference-profile/global.anthropic.claude-sonnet-4-20250514-v1:0"
@@ -226,7 +354,8 @@ def run_example():
     thread_id = str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread_id}}
     
-    # Example questions
+    # Example questions - uncomment for testing
+    
     questions = [
         "Hi there!",
         "I want to know about solar savings",
@@ -235,25 +364,56 @@ def run_example():
     
     print("=== Solar Savings Assistant Demo ===\n")
     
-    # Process each question
+    # Process each question with delays to avoid rate limiting
     for i, question in enumerate(questions, 1):
         print(f"User ({i}): {question}")
         
-        # Stream the response
-        events = graph.stream(
-            {"messages": [HumanMessage(content=question)]}, 
-            config, 
-            stream_mode="values"
-        )
+        # Add delay between requests to avoid throttling
+        if i > 1:
+            print("(Waiting to avoid rate limits...)")
+            time.sleep(10)
         
-        for event in events:
-            if "messages" in event:
-                last_message = event["messages"][-1]
-                if hasattr(last_message, 'content') and last_message.content:
-                    if isinstance(last_message, AIMessage):
-                        print(f"Assistant: {last_message.content}")
-                    elif isinstance(last_message, ToolMessage):
-                        print(f"Tool Result: {last_message.content}")
+        try:
+            # Stream the response
+            events = graph.stream(
+                {"messages": [HumanMessage(content=question)]}, 
+                config, 
+                stream_mode="values"
+            )
+            
+            for event in events:
+                if "messages" in event:
+                    last_message = event["messages"][-1]
+                    if hasattr(last_message, 'content') and last_message.content:
+                        if isinstance(last_message, AIMessage):
+                            print(f"Assistant: {last_message.content}")
+                        elif isinstance(last_message, ToolMessage):
+                            print(f"Tool Result: {last_message.content}")
+                            
+        except Exception as e:
+            if "ThrottlingException" in str(e) or "Too many requests" in str(e):
+                print(f"Rate limit hit. Waiting 10 seconds and retrying...")
+                time.sleep(10)
+                # Retry once
+                try:
+                    events = graph.stream(
+                        {"messages": [HumanMessage(content=question)]}, 
+                        config, 
+                        stream_mode="values"
+                    )
+                    
+                    for event in events:
+                        if "messages" in event:
+                            last_message = event["messages"][-1]
+                            if hasattr(last_message, 'content') and last_message.content:
+                                if isinstance(last_message, AIMessage):
+                                    print(f"Assistant: {last_message.content}")
+                                elif isinstance(last_message, ToolMessage):
+                                    print(f"Tool Result: {last_message.content}")
+                except Exception as retry_error:
+                    print(f"Retry failed: {retry_error}")
+            else:
+                print(f"Error: {e}")
         
         print("-" * 50)
 
@@ -299,7 +459,8 @@ def create_chat_interface():
 
 if __name__ == "__main__":
     # Run example
+    setup_credentials_from_file()
     run_example()
     
     # Uncomment to start interactive chat
-    # create_chat_interface()
+    #create_chat_interface()
